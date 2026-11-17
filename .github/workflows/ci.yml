@@ -1,0 +1,224 @@
+# CI pipeline. Three jobs:
+#   test            - formatting, vet and race-enabled tests on every push and PR.
+#   build           - multi-arch Docker image, pushed to GHCR except on pull requests.
+#   refresh-release - nightly only: rebuilds the newest release and re-pushes its tags.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"] # Release tags such as v1.2.3.
+  pull_request:
+  # Nightly run, so main and the newest release are rebuilt from fresh base
+  # images and CA certs (see no-cache below and the refresh-release job).
+  schedule:
+    - cron: "0 0 * * *" # 00:00 UTC every day.
+  workflow_dispatch: # Allows a manual run from the Actions tab.
+
+# Actions are pinned to commit SHAs (tag in the trailing comment) so a moved
+# or hijacked tag cannot change what runs. Dependabot updates both together.
+
+# Least privilege: the default token can only read the repository.
+# The build job raises its own permissions where it needs to push.
+permissions:
+  contents: read
+
+# One run per ref at a time. On pull requests, a newer push cancels the older run.
+# Pushes to main and tags are never canceled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Reads the Go version from go.mod, so the toolchain matches the module.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # Fails if any file is not gofmt-formatted, and prints the offending files.
+      - name: Format check
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Vet
+        run: go vet ./...
+
+      # -race enables the data-race detector. -count=1 disables the test cache.
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  build:
+    name: Build image
+    # Runs only after test passes, so a broken build never publishes an image.
+    needs: test
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write # Needed to push to GHCR.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Date tag in YYYY-MM-DD form, used for the nightly image tags.
+      - name: Compute date tag
+        id: date
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      # Needed for multi-platform builds (linux/amd64 and linux/arm64).
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Skipped on pull requests, which only build and do not push.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Generates the tag list. Branch, PR and sha tags are always added. The
+      # nightly and date tags are added only on the scheduled run.
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/inksoftware/cloudflare-ddns
+          tags: |
+            type=raw,value=nightly,enable=${{ github.event_name == 'schedule' }}
+            type=raw,value=${{ steps.date.outputs.date }},enable=${{ github.event_name == 'schedule' }}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+
+      # On a release tag such as v1.2.3, adds the semver tags 1, 1.2 and 1.2.3.
+      # Other refs produce no extra tags. The output uses a multi-line
+      # heredoc-style value, which is why it is written with EOF markers.
+      - name: Release version tags
+        id: release
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          IMAGE: ghcr.io/inksoftware/cloudflare-ddns
+        run: |
+          tags=""
+          # Matches vMAJOR, vMAJOR.MINOR or vMAJOR.MINOR.PATCH. Captures each part.
+          if [[ "$REF_TYPE" == tag && "$REF_NAME" =~ ^v([0-9]+)(\.([0-9]+))?(\.([0-9]+))?$ ]]; then
+            major=${BASH_REMATCH[1]}
+            minor=${BASH_REMATCH[3]}
+            patch=${BASH_REMATCH[5]}
+            tags="$IMAGE:$major"
+            if [[ -n $minor ]]; then tags+=$'\n'"$IMAGE:$major.$minor"; fi
+            if [[ -n $patch ]]; then tags+=$'\n'"$IMAGE:$major.$minor.$patch"; fi
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Builds for both platforms and pushes unless this is a pull request.
+      # pull: true refreshes base images. no-cache applies only to the nightly
+      # run, which rebuilds from scratch to pick up upstream security fixes.
+      # provenance and sbom attach supply-chain metadata to the image.
+      # The GitHub Actions cache (type=gha) speeds up later builds.
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          pull: true
+          no-cache: ${{ github.event_name == 'schedule' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ steps.release.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Nightly only: rebuilds the newest vX.Y.Z release from scratch and re-pushes
+  # its X, X.Y and X.Y.Z tags, so users on a release tag (compose defaults to
+  # `1`) get the fresh CA bundle and base images too. Base image versions are
+  # kept current by Dependabot. Only the newest release line is refreshed.
+  refresh-release:
+    name: Rebuild latest release
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write # Needed to push to GHCR.
+    steps:
+      # fetch-depth 0 fetches every tag, so the newest release can be found.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Picks the highest vX.Y.Z tag by version order, checks it out, and
+      # derives the image tags. found=false skips the rest if none exists.
+      - name: Find latest release
+        id: release
+        env:
+          IMAGE: ghcr.io/inksoftware/cloudflare-ddns
+        run: |
+          tag=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+          if [[ -z $tag ]]; then
+            echo "No release tag found; nothing to rebuild."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git checkout --quiet "$tag"
+          v=${tag#v}
+          {
+            echo "found=true"
+            echo "version=$v"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "tags<<EOF"
+            echo "$IMAGE:${v%%.*}"
+            echo "$IMAGE:${v%.*}"
+            echo "$IMAGE:$v"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Re-runs the release's own tests before re-publishing it.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.release.outputs.found == 'true'
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        if: steps.release.outputs.found == 'true'
+        run: go test -race -count=1 ./...
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.release.outputs.found == 'true'
+
+      - name: Log in to GHCR
+        if: steps.release.outputs.found == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.release.outputs.found == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          pull: true
+          no-cache: true
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.release.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.revision }}
+          provenance: mode=max
+          sbom: true

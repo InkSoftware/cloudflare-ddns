@@ -1,0 +1,51 @@
+name: cloudflare-ddns
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+    compress: "true"
+
+services:
+  cloudflare-ddns:
+    image: ${DDNS_IMAGE:-ghcr.io/inksoftware/cloudflare-ddns}:${IMAGE_TAG:-1}
+    container_name: cloudflare-ddns
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      CF_TOKEN: "${CF_TOKEN:?CF_TOKEN is required}"
+      CF_ZONE: "${CF_ZONE:?CF_ZONE is required}"
+      CF_RECORD: "${CF_RECORD:?CF_RECORD is required}"
+      # Empty values fall back to the program's defaults.
+      CF_ZONE_ID: "${CF_ZONE_ID:-}"
+      CF_TTL: "${CF_TTL:-}"
+      CF_PROXIED: "${CF_PROXIED:-}"
+      CF_IPV4: "${CF_IPV4:-}"
+      CF_IPV6: "${CF_IPV6:-}"
+      CF_CREATE_MISSING: "${CF_CREATE_MISSING:-}"
+      DDNS_INTERVAL: "${DDNS_INTERVAL:-}"
+      CACHE_MAX_AGE: "${CACHE_MAX_AGE:-}"
+      FORCE: "${FORCE:-}"
+      # CACHE_DIR and HEALTH_FILE are not passed: their defaults live on the
+      # /tmp tmpfs, the only writable path, and the image healthcheck reads
+      # the default HEALTH_FILE.
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "${DDNS_CPU_LIMIT:-0.1}"
+          memory: "${DDNS_MEMORY_LIMIT:-16m}"
+          pids: ${DDNS_PIDS_LIMIT:-32}
+        reservations:
+          memory: "${DDNS_MEMORY_RESERVATION:-8m}"
+
+networks:
+  default:
+    name: cloudflare-ddns

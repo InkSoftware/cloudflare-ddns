@@ -1,0 +1,4 @@
+services:
+  cloudflare-ddns:
+    deploy:
+      resources: !reset {}
