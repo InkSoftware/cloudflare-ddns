@@ -9,7 +9,7 @@ x-logging: &default-logging
 
 services:
   cloudflare-ddns:
-    image: ${DDNS_IMAGE:-ghcr.io/inksoftware/cloudflare-ddns}:${IMAGE_TAG:-1}
+    image: ghcr.io/inksoftware/cloudflare-ddns:1.0.0
     container_name: cloudflare-ddns
     restart: unless-stopped
     read_only: true

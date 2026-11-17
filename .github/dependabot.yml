@@ -31,3 +31,11 @@ updates:
       interval: weekly
     commit-message:
       prefix: "docker"
+
+  # Image tags referenced in docker-compose*.yml files.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "docker"
